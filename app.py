@@ -49,12 +49,10 @@ from dotenv import load_dotenv
 
 # ── env ────────────────────────────────────────────────────────────────────────
 load_dotenv(dotenv_path=str(Path(__file__).resolve().parent / ".env"))
-# Ensure the SQLite DB file is writable (set permissions if possible)
-if os.path.exists("demo.db"):
-    try:
-        os.chmod("demo.db", 0o666)
-    except Exception as e:
-        logging.warning(f"Could not set DB permissions: {e}")
+# NOTE: Vercel's deployed filesystem is READ-ONLY except for /tmp.
+# DB_PATH below is resolved to /tmp/demo.db automatically when running on
+# Vercel (detected via the VERCEL env var), so no chmod/local-file writes
+# are attempted against the read-only bundle path.
 
 # ── app ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="AI Database Agent", version="3.2.0")
@@ -94,7 +92,25 @@ settings = Settings()
 OPENAI_API_KEY  = settings.OPENAI_API_KEY
 OPENAI_API_BASE = settings.OPENAI_API_BASE
 OPENAI_MODEL    = settings.OPENAI_MODEL
-DB_PATH = str((_BASE_DIR / settings.DATABASE_URL).resolve())
+
+# ── DB PATH (writable-filesystem aware) ─────────────────────────────────────────
+# Vercel's serverless functions ship a READ-ONLY filesystem for everything
+# except /tmp. Writing to the bundled path (e.g. CREATE TABLE / INSERT during
+# init_db) throws "attempt to write a readonly database". Detect Vercel via
+# its auto-set VERCEL env var and redirect the SQLite file to /tmp instead.
+# /tmp is ephemeral (wiped on cold start), but since init_db() regenerates the
+# full demo dataset from scratch every time anyway, this is a safe trade-off
+# for this hackathon/demo database. For a real persistent DB, swap SQLite for
+# a hosted Postgres/Turso instance instead.
+_IS_VERCEL = bool(os.environ.get("VERCEL"))
+
+if _IS_VERCEL:
+    DB_PATH = f"/tmp/{Path(settings.DATABASE_URL).name}"
+else:
+    DB_PATH = str((_BASE_DIR / settings.DATABASE_URL).resolve())
+
+logging.info(f"[DB] Writable filesystem mode: {'Vercel (/tmp)' if _IS_VERCEL else 'local'}")
+logging.info(f"[DB] DB_PATH = {DB_PATH}")
 
 if not OPENAI_API_KEY:
     logging.warning("OPENAI_API_KEY not set — LLM features will use smart fallback.")
