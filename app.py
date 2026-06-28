@@ -96,21 +96,65 @@ OPENAI_MODEL    = settings.OPENAI_MODEL
 # ── DB PATH (writable-filesystem aware) ─────────────────────────────────────────
 # Vercel's serverless functions ship a READ-ONLY filesystem for everything
 # except /tmp. Writing to the bundled path (e.g. CREATE TABLE / INSERT during
-# init_db) throws "attempt to write a readonly database". Detect Vercel via
-# its auto-set VERCEL env var and redirect the SQLite file to /tmp instead.
-# /tmp is ephemeral (wiped on cold start), but since init_db() regenerates the
-# full demo dataset from scratch every time anyway, this is a safe trade-off
-# for this hackathon/demo database. For a real persistent DB, swap SQLite for
-# a hosted Postgres/Turso instance instead.
-_IS_VERCEL = bool(os.environ.get("VERCEL"))
+# init_db) throws "attempt to write a readonly database".
+#
+# We don't rely on a single env var (VERCEL isn't always present at runtime
+# depending on framework preset / build config). Instead we check several
+# Vercel-specific env vars AND actually probe whether the candidate directory
+# is writable. If it isn't, we fall back to /tmp no matter what.
+_VERCEL_ENV_HINTS = any(os.environ.get(k) for k in (
+    "VERCEL", "VERCEL_ENV", "VERCEL_URL", "VERCEL_REGION", "NOW_REGION"
+))
 
-if _IS_VERCEL:
+def _dir_is_writable(path: Path) -> bool:
+    probe = path / ".write_test_tmp"
+    try:
+        probe.write_text("ok")
+        probe.unlink()
+        return True
+    except Exception:
+        return False
+
+_local_candidate = (_BASE_DIR / settings.DATABASE_URL).resolve()
+_local_dir_writable = _dir_is_writable(_local_candidate.parent)
+
+_USE_TMP = _VERCEL_ENV_HINTS or not _local_dir_writable
+
+if _USE_TMP:
     DB_PATH = f"/tmp/{Path(settings.DATABASE_URL).name}"
 else:
-    DB_PATH = str((_BASE_DIR / settings.DATABASE_URL).resolve())
+    DB_PATH = str(_local_candidate)
 
-logging.info(f"[DB] Writable filesystem mode: {'Vercel (/tmp)' if _IS_VERCEL else 'local'}")
+logging.info(
+    f"[DB] vercel_env_hints={_VERCEL_ENV_HINTS} local_dir_writable={_local_dir_writable} "
+    f"=> using {'/tmp' if _USE_TMP else 'local path'}"
+)
 logging.info(f"[DB] DB_PATH = {DB_PATH}")
+
+
+def get_db_connection() -> sqlite3.Connection:
+    """
+    Single choke point for every SQLite connection in this app.
+    Self-heals: if DB_PATH turns out to be unwritable at connect time for any
+    reason (e.g. env-var detection missed a Vercel runtime quirk), it falls
+    back to /tmp/demo.db on the spot instead of raising
+    "attempt to write a readonly database" deep inside a request handler.
+    """
+    global DB_PATH
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA query_only = OFF;")
+        return conn
+    except sqlite3.OperationalError as exc:
+        if "readonly database" in str(exc).lower() and not DB_PATH.startswith("/tmp/"):
+            fallback = f"/tmp/{Path(DB_PATH).name}"
+            logging.warning(
+                f"[DB] DB_PATH '{DB_PATH}' turned out read-only at connect time "
+                f"({exc}). Falling back to '{fallback}'."
+            )
+            DB_PATH = fallback
+            return get_db_connection()
+        raise
 
 if not OPENAI_API_KEY:
     logging.warning("OPENAI_API_KEY not set — LLM features will use smart fallback.")
@@ -127,7 +171,7 @@ _llm = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_API_BASE, timeout=30.0)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_schema() -> dict:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
     tables = c.execute(
         "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
@@ -195,7 +239,7 @@ def validate_sql(sql: str, schema: dict) -> tuple:
 
 def run_sql(sql: str) -> dict:
     sql = sql.strip().rstrip(";")
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     t0 = time.time()
@@ -925,7 +969,7 @@ COLUMNS: {cols}
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_db_stats() -> dict:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
     tables = c.execute(
         "SELECT name FROM sqlite_master WHERE type='table'"
@@ -940,7 +984,7 @@ def get_db_stats() -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
     c.executescript("""
         CREATE TABLE IF NOT EXISTS regions (
@@ -1107,7 +1151,7 @@ async def chat(body: ChatRequest):
         raise HTTPException(400, "No query provided")
 
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute(
             "INSERT INTO messages (session_id, role, content) VALUES (?,?,?)",
@@ -1126,7 +1170,7 @@ async def chat(body: ChatRequest):
 
         # ── Auto-save to query_history ─────────────────────────────────────
         try:
-            conn2 = sqlite3.connect(DB_PATH)
+            conn2 = get_db_connection()
             c2 = conn2.cursor()
             c2.execute(
                 """INSERT INTO query_history (query, sql_generated, chart_type, chart_title, row_count)
@@ -1144,7 +1188,7 @@ async def chat(body: ChatRequest):
         except Exception as he:
             logging.warning(f"History save failed: {he}")
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute(
             "INSERT INTO messages (session_id, role, content) VALUES (?,?,?)",
@@ -1212,7 +1256,7 @@ async def chat(body: ChatRequest):
 
 @app.get("/api/history")
 def get_history(favorites_only: bool = Query(False), limit: int = Query(50)):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
     if favorites_only:
         rows = c.execute(
@@ -1241,7 +1285,7 @@ def get_history(favorites_only: bool = Query(False), limit: int = Query(50)):
 
 @app.post("/api/history/favorite")
 def toggle_favorite(body: FavoriteRequest):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute(
         "UPDATE query_history SET is_favorite=? WHERE id=?",
@@ -1254,7 +1298,7 @@ def toggle_favorite(body: FavoriteRequest):
 
 @app.delete("/api/history/{history_id}")
 def delete_history(history_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("DELETE FROM query_history WHERE id=?", (history_id,))
     conn.commit()
@@ -1358,7 +1402,7 @@ def tables_endpoint():
 @app.get("/api/health")
 def health():
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         conn.execute("SELECT 1")
         conn.close()
         stats = get_db_stats()
